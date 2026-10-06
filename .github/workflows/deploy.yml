@@ -185,7 +185,8 @@ jobs:
             [ "$ok" = 1 ] || { echo "E: release.json not reachable over HTTPS" >&2; exit 1; }
             cat /tmp/release.json
             jq -e --arg c "$CONTENT_SHA" '.content_sha == $c' /tmp/release.json > /dev/null
-            curl -fsS --max-time 10 https://chaloa.cc/ | grep -q "<title>"
+            curl -fsS --max-time 10 https://chaloa.cc/ -o /tmp/index.html
+            grep -q "<title>" /tmp/index.html
             curl -fsS --max-time 10 -o /dev/null -w 'rss=%{http_code}\n' https://chaloa.cc/rss.xml
             echo "OK: release $STAMP is live and publicly verified"
           else
