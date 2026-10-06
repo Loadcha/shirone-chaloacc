@@ -19,6 +19,10 @@ import SiteStats from "@components/molecules/SiteStats.astro";
 import Tags from "@components/molecules/Tags.astro";
 import I18nKey from "@i18n/i18nKey";
 import { i18n } from "@i18n/translation";
+import {
+	getResponsiveSidebarConfig,
+	isDualColumn,
+} from "@utils/responsive-utils";
 import { isWidgetVisibleOnPage, pagesToAttribute } from "@utils/sidebar-page";
 import { musicConfig, resolveMusicOptions } from "@/config/musicConfig";
 import { sidebarConfig } from "@/config/sidebarConfig";
@@ -82,12 +86,16 @@ const componentMap = {
 type WidgetRenderer = (props: Record<string, unknown>) => unknown;
 
 // 按列取整：SSR 不做页面过滤（全量渲染，swup 导航后客户端才能恢复
-// 被隐藏的 widget），页面可见性仅体现在包装层的 hidden 标记上
+// 被隐藏的 widget），页面可见性仅体现在包装层的 hidden 标记上。
+// 三列（dual）未真正生效时 column 标签失效：副栏实例根本不存在，
+// 此时 secondary widget 必须落回主栏，否则会被静默丢弃
+// （契约见 src/types/sidebarConfig.ts 的 SidebarColumn、docs/sidebar-system.md §3）。
+const dualActive = isDualColumn(getResponsiveSidebarConfig());
 const widgets = sidebarConfig.enable
 	? sidebarConfig.components.filter(
 			(widget) =>
 				widget.enable &&
-				(widget.column ?? "primary") === column &&
+				(dualActive ? (widget.column ?? "primary") : "primary") === column &&
 				(widget.type !== "music" || MusicSidebar !== null),
 		)
 	: [];

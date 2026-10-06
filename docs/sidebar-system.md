@@ -125,11 +125,16 @@ widget 的专属配置（如分类的折叠阈值 `collapseAfter`）只存在于
 | ≥ 1280px | `single`：两列不变；`dual`（且副栏有 enable 的 widget）：三列 `副栏 · 内容 · 主栏` |
 
 > 副栏为空时 `dual` 实际等同 `single`——这是有意设计：副栏没有内容就不占位，不会出现空列。
+>
+> `column` 标签只在三列真正生效时有效：`arrangement: "single"`，或 `dual` 但副栏没有 enable 的 widget（副栏不渲染）时，声明为 `secondary` 的 widget**落回主栏**，不会被丢弃（判定见 `src/components/organisms/SideBar.astro` 的 `isDualColumn(getResponsiveSidebarConfig())`）。
+> 注意区分「配置层退化」与「CSS 层退化」：`dual` 生效时副栏在 1024–1279px 只是 CSS `hidden`（元素仍在 DOM），该区间声明为 `secondary` 的 widget 依旧留在副栏、因此不可见。
 
 ## 4. 页框与 TOC 联动
 
 - **页框宽度自动解析**：`--page-width` 由 `resolvePageWidth()`（`src/utils/responsive-utils.ts`）按编排注入——`single` → 85rem，`dual`（三列生效时）→ 96rem。导航栏 / 主面板 / TOC 容器的 `max-w-[var(--page-width)]` 全部自动跟随，无需手改。
-- **TOC 让位**：三列生效时右侧悬浮目录轨（`min-[1700px]` rail）自动隐藏，避免与副栏抢右侧视口余量；空的 `#toc` 元素保留（它是 swup 的替换容器，删除会破坏切页）。
+- **TOC 让位**：三列生效时右侧悬浮目录轨（`min-[1700px]` rail）自动隐藏，避免与副栏抢右侧视口余量。
+- **`#toc` 是 Swup 替换容器，必须存在**：它由 `toc` widget（`SidebarTOC`）输出；`SideBar` 只做页面过滤，非 `post` 页仅包装层 `hidden`，元素仍在 DOM。`integrationsConfig.ts` 的 `containers: ["main", "#toc"]` 是常量，`#toc` 一旦缺失，Swup 会以 `Container mismatch, aborting` 中止访问：站内导航退化为整页刷新，并把 `is-changing/is-animating/is-rendering` 留在 `<html>`（`transition.css` 的 `opacity: 0`），浏览器前进/后退经 bfcache 恢复该文档时表现为界面卡死。
+  - 因此 `toc` widget **必须保持 `enable: true`**：关闭 `toc`、关闭 `sidebar.enable`，或让它所在的栏位不被渲染（§3 的落回规则会把单栏下的 `secondary` 拉回主栏，其他情况同样要留意），都会让 `#toc` 消失、站内路由退化为整页刷新。
 - 调整默认宽度：`src/constants/constants.ts` 的 `PAGE_WIDTH` / `PAGE_WIDTH_DUAL`。
 
 ## 5. 配置示例
