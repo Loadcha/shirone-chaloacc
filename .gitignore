@@ -38,9 +38,6 @@ yarn.lock
 # ide
 .idea
 
-# generated font subsets
-src/assets/fonts/.subset/
-
 # generated local icon collection
 src/generated/local-icon-collections.ts
 *.iml
@@ -79,7 +76,9 @@ artifacts/shirone-ai-*
 /src/user/user-config.ts
 /src/config/FooterConfig.html
 /src/assets/images/
+/src/assets/fonts/
 /public/images/
+/public/branding/
 /public/assets/banner/
 /public/assets/music/
 /public/assets/projects/
