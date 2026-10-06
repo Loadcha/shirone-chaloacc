@@ -1,20 +1,6 @@
-# 双仓部署示例：内容仓推送 -> 本仓库重新构建 -> 部署。
-#
-# 这个文件不会被 GitHub Actions 执行（扩展名不是 .yml），因为 Shirone 的使用者
-# 部署在不同平台上，仓库只提供通用的触发与构建部分。
-#
-# 启用方式：
-#   1. 复制为 .github/workflows/deploy.yml；
-#   2. 把 CONTENT_REPOSITORY 换成你的内容仓；
-#   3. 替换最后的「Deploy」一步为你的平台命令（文件末尾给了四种常见写法）；
-#   4. 在仓库 Settings > Secrets and variables > Actions 配置所需凭据。
-#
-# 前置条件见 docs/content-separation.md。
-
 name: Deploy
 
 on:
-  # 代码变更。
   push:
     branches: [main]
     paths-ignore:
@@ -22,24 +8,20 @@ on:
       - "rules/**"
       - "README*.md"
       - "*.md"
-  # 内容仓推送后由 trigger-build.yml 发来的事件（由 trigger-build.yml.example 去掉 .example 启用）。
+  # content repo dispatches this after a push (see A9)
   repository_dispatch:
     types: [content-updated]
-  # 手动触发；回滚时把 content_ref 填成旧的内容 SHA。
+  # manual build; pass an old content SHA to rebuild a previous content revision
   workflow_dispatch:
     inputs:
       content_ref:
-        description: "内容仓 ref 或 commit SHA（留空使用 main）"
+        description: "Content repo ref or commit SHA (empty = main)"
         required: false
         default: ""
-  # 兜底：repository_dispatch 事件偶尔会丢，每天重建一次保证最终一致。
+  # NOTE: GitHub disables scheduled workflows on forks. Kept as intent; do not rely on it.
   schedule:
     - cron: "17 4 * * *"
 
-# 并发控制：同一时间只允许一个部署流水线运行。
-# 无论是代码仓代码推送（push）还是内容仓触发（repository_dispatch），
-# 均归入同一个 deploy 并发通道。新的构建请求会自动取消正在运行中的旧构建，
-# 确保始终以最新一次提交（最新代码 + 最新内容）为准，杜绝并发竞争。
 concurrency:
   group: deploy
   cancel-in-progress: true
@@ -50,22 +32,22 @@ permissions:
 env:
   CONTENT_REPOSITORY: Loadcha/shirone-content
   CONTENT_WORKING_COPY: .content-src
+  DEPLOY_BASE: /loadcha/30_developing/chaloacc
+  KEEP_RELEASES: "2"
 
 jobs:
   deploy:
     name: Build and deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       CI: true
-      # 让 content:sync 走「本地目录」模式，内容由下面的 checkout 步骤取得。
+      # switch content:sync to "local directory" mode; content is checked out below
       CONTENT_DIR: .content-src
 
     steps:
       - name: Resolve content ref
         id: target
-        # 经 env 传递而不是直接内插到脚本里：client_payload 属于外部输入，
-        # 直接内插会形成 shell 注入面。
         env:
           PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
           INPUT_REF: ${{ github.event.inputs.content_ref }}
@@ -85,7 +67,6 @@ jobs:
           repository: ${{ env.CONTENT_REPOSITORY }}
           ref: ${{ steps.target.outputs.ref }}
           path: ${{ env.CONTENT_WORKING_COPY }}
-          # 内容仓公开时可以删掉 token 一行。
           token: ${{ secrets.CONTENT_REPO_TOKEN }}
           persist-credentials: false
 
@@ -108,13 +89,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
-      - name: Restore build caches
+      - name: Restore thumbnail cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          # 缩略图按源图内容哈希复用，跨 commit 的缓存命中安全且有效；
-          # 内容层存储（.astro / node_modules/.astro）不跨 commit 缓存，避免集合清空后旧条目残留。
-          path: |
-            public/assets/moments/thumbnails
+          path: public/assets/moments/thumbnails
           key: ${{ runner.os }}-shirone-thumbnails-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-shirone-thumbnails-
@@ -122,14 +100,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline
 
-      # 独立成步，而不是依赖 `pnpm build` 内部再跑一次：
-      # 内容问题（含 config/*.yaml 的类型校验）与构建问题因此在日志里天然分开，
-      # 且 fonts:subset 需要内容与配置都已就位。
       - name: Materialize content and config
         run: pnpm content:sync
 
-      # 番剧数据与封面：缓存 + 按需刷新。
-      # 未配置 provider 时，anime:sync 会自动跳过并 exit 0，对未启用番剧的站点零影响。
       - name: Restore anime cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -148,94 +121,105 @@ jobs:
       - name: Build site
         run: pnpm build
         env:
-          # 按需补齐可选功能的凭据。
           BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}
 
-      # ───────────────────────────────────────────────────────────────────────
-      # 部署：按你的平台替换这一步，下面给了四种常见写法。
-      # ───────────────────────────────────────────────────────────────────────
-      - name: Deploy to device B (Windows)
+      - name: Package release
+        id: pkg
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          pkg="dist-${stamp}-${GITHUB_SHA::7}.tar.gz"
+          tar -czf "$pkg" -C dist .
+          sha="$(sha256sum "$pkg" | cut -d' ' -f1)"
+          {
+            echo "stamp=$stamp"
+            echo "pkg=$pkg"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "packaged $pkg ($sha)"
+
+      - name: Deploy to device chaloa
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_REMOTE_DIR: 'C:/loadcha/30_developing/chaloa-cc'
-          DEPLOY_SCRIPT:   'C:/loadcha/30_developing/chaloa-cc/deploy.ps1'
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          STAMP: ${{ steps.pkg.outputs.stamp }}
+          PKG: ${{ steps.pkg.outputs.pkg }}
+          PKG_SHA: ${{ steps.pkg.outputs.sha }}
+          THEME_SHA: ${{ github.sha }}
+          CONTENT_SHA: ${{ steps.content.outputs.sha }}
         run: |
           set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
 
-          # 1) 私钥写入本次 runner 临时目录（job 结束即销毁）
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          SSH_OPTS=(-i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$DEPLOY_PORT")
+          SCP_OPTS=(-i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -P "$DEPLOY_PORT")
+          TARGET="$DEPLOY_USER@$DEPLOY_HOST"
 
-          # 2) 信任主机公钥。端口必须是 2201，否则扫到的是 DEV_C 的 22 端口钥匙。
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh "${SSH_OPTS[@]}" "$TARGET" "install -d -m 755 '$DEPLOY_BASE/incoming'"
+          prev="$(ssh "${SSH_OPTS[@]}" "$TARGET" "readlink '$DEPLOY_BASE/current' 2>/dev/null | sed 's#^releases/##'" || true)"
+          scp "${SCP_OPTS[@]}" "$PKG" "$TARGET:$DEPLOY_BASE/incoming/$PKG"
+          ssh "${SSH_OPTS[@]}" "$TARGET" \
+            "bash '$DEPLOY_BASE/bin/release.sh' '$STAMP' '$PKG' '$PKG_SHA' '$THEME_SHA' '$CONTENT_SHA' '$KEEP_RELEASES'"
+          echo "${prev:-none}" > ./.previous_release
+          echo "$STAMP" > ./.deployed_stamp
 
-          # 3) 打包产物（末尾的 "." 表示目录内容而非目录本身）
-          tar -czf shirone-dist.tar.gz -C dist .
+          # on-host truth: `current` must point at the release we just published
+          ssh "${SSH_OPTS[@]}" "$TARGET" "readlink '$DEPLOY_BASE/current' | grep -qx 'releases/$STAMP'"
 
-          # 4) 上传到 DEV_B（Windows 绝对路径 + 正斜杠，实测可用）
-          scp -P "$DEPLOY_PORT" -i ~/.ssh/deploy_key \
-            shirone-dist.tar.gz \
-            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_REMOTE_DIR/dist.tar.gz"
+          # Public verification only makes sense once the static vhost is live (P4).
+          # Before cutover nginx still proxies to the tunnel, which does not serve release.json,
+          # so strict HTTPS checks here would fail for the wrong reason.
+          if ssh "${SSH_OPTS[@]}" "$TARGET" "grep -q 'root $DEPLOY_BASE/current;' /etc/nginx/sites-available/shirone"; then
+            ok=0
+            for i in 1 2 3 4 5; do
+              if curl -fsS --max-time 10 https://chaloa.cc/release.json -o /tmp/release.json; then ok=1; break; fi
+              sleep 3
+            done
+            [ "$ok" = 1 ] || { echo "E: release.json not reachable over HTTPS" >&2; exit 1; }
+            cat /tmp/release.json
+            jq -e --arg c "$CONTENT_SHA" '.content_sha == $c' /tmp/release.json > /dev/null
+            curl -fsS --max-time 10 https://chaloa.cc/ | grep -q "<title>"
+            curl -fsS --max-time 10 -o /dev/null -w 'rss=%{http_code}\n' https://chaloa.cc/rss.xml
+            echo "OK: release $STAMP is live and publicly verified"
+          else
+            echo "OK: release $STAMP staged at $DEPLOY_BASE/current (vhost still proxying; cut over in P4 to serve it)"
+          fi
 
-          # 5) 远端执行发布脚本：DEV_B 的 sshd 默认 shell 是 cmd.exe 且 PATH 极简，
-          #    PowerShell 必须写完整路径（实测：非管理员会话连 whoami 都不在 PATH 里）。
-          ssh -p "$DEPLOY_PORT" -i ~/.ssh/deploy_key \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DEPLOY_SCRIPT"
-
-          # 6) 清理 runner 上的临时包
-          rm -f shirone-dist.tar.gz
-
-      # 变体 A：Vercel（关闭 Vercel 的 Git 自动构建，改由 Actions 交付产物）
-      # - name: Deploy to Vercel
-      #   run: |
-      #     pnpm dlx vercel@latest deploy dist --prod --yes \
-      #       --token "$VERCEL_TOKEN"
-      #   env:
-      #     VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-      #     VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-      #     VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-
-      # 变体 B：GitHub Pages（需要把顶层 permissions 改为
-      # `contents: read` + `pages: write` + `id-token: write`，并配置 environment）
-      # - name: Upload Pages artifact
-      #   uses: actions/upload-pages-artifact@<pinned-sha>
-      #   with:
-      #     path: dist
-      # - name: Deploy to Pages
-      #   uses: actions/deploy-pages@<pinned-sha>
-
-      # 变体 C：自有服务器（rsync over SSH）
-      # - name: Deploy to server
-      #   env:
-      #     DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-      #     DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-      #     DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-      #     DEPLOY_DIR: /www/wwwroot/shirone
-      #   run: |
-      #     set -euo pipefail
-      #     mkdir -p ~/.ssh && chmod 700 ~/.ssh
-      #     printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-      #     chmod 600 ~/.ssh/deploy_key
-      #     ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
-      #     rsync -az --delete -e "ssh -i ~/.ssh/deploy_key" \
-      #       dist/ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_DIR/dist/"
-
-      # 变体 D：平台自建构建（Netlify / EdgeOne 等 Deploy Hook）。
-      # 这种平台会自己 clone 代码仓并执行 `pnpm build`，因此需要在平台的环境变量里
-      # 配置 CONTENT_REPO_URL（私有仓用 https://x-access-token:<TOKEN>@... 形式），
-      # 由 content:sync 在平台侧拉取内容。此时本 workflow 只负责触发：
-      # - name: Trigger platform build
-      #   env:
-      #     DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK }}
-      #   run: |
-      #     set -euo pipefail
-      #     curl --fail-with-body --silent --show-error --retry 3 --retry-delay 2 \
-      #       --max-time 30 --request POST "$DEPLOY_HOOK"
+      - name: Rollback on failure
+        if: failure()
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"; chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"; chmod 600 "$HOME/.ssh/known_hosts"
+          # Only roll back if this run actually flipped `current`; otherwise a failure earlier in the
+          # pipeline would revert a *healthy* site to an older release.
+          if [ ! -f ./.deployed_stamp ]; then
+            echo "no release switch happened in this run; nothing to roll back"
+            exit 0
+          fi
+          prev="$(cat ./.previous_release 2>/dev/null || echo none)"
+          if [ -z "$prev" ] || [ "$prev" = "none" ]; then
+            echo "no previous release recorded; manual intervention required (see §9)" >&2
+            exit 0
+          fi
+          echo "rolling back to releases/$prev"
+          ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" "bash '$DEPLOY_BASE/bin/rollback.sh' '$prev'" || true
+          curl -fsS --max-time 10 https://chaloa.cc/release.json || true
 
       - name: Summarize
         if: always()
@@ -244,17 +228,9 @@ jobs:
           {
             echo "### Shirone deploy"
             echo ""
-            echo "- 内容仓：\`${CONTENT_REPOSITORY}\`"
-            echo "- 内容 ref：\`${{ steps.target.outputs.ref }}\`"
-            echo "- 内容 commit：\`${{ steps.content.outputs.sha }}\`"
-            if [ -f content.lock.json ]; then
-              echo ""
-              echo "<details><summary>content.lock.json</summary>"
-              echo ""
-              echo '```json'
-              cat content.lock.json
-              echo '```'
-              echo ""
-              echo "</details>"
-            fi
+            echo "- content repo: \`${CONTENT_REPOSITORY}\`"
+            echo "- content ref: \`${{ steps.target.outputs.ref }}\`"
+            echo "- theme commit: \`${{ github.sha }}\`"
+            echo "- content commit: \`${{ steps.content.outputs.sha }}\`"
+            echo "- release stamp: \`${{ steps.pkg.outputs.stamp }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
